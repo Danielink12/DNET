@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // Configuración básica
@@ -245,16 +249,31 @@ func handleTunnelRequest(tunnel *Tunnel, req *Request) {
 	}
 }
 
-func handlePublic(w http.ResponseWriter, r *http.Request) {
-	// Determinar subdomain (por ahora, usar header o parámetro)
-	subdomain := r.Header.Get("X-Tunnel-Subdomain")
-	if subdomain == "" {
-		subdomain = r.URL.Query().Get("subdomain")
+// extractSubdomain deriva el subdomain a partir del Host de la request pública,
+// no de un header/query controlable por el cliente. Solo acepta un nivel de
+// subdomain (sin puntos) bajo baseDomain; cualquier otra cosa se rechaza.
+func extractSubdomain(host, baseDomain string) (string, bool) {
+	host = strings.Split(host, ":")[0] // descartar el puerto si viene incluido
+	suffix := "." + baseDomain
+	if !strings.HasSuffix(host, suffix) {
+		return "", false
 	}
-	if subdomain == "" {
-		subdomain = "demo" // Default
+	sub := strings.TrimSuffix(host, suffix)
+	if sub == "" || strings.Contains(sub, ".") {
+		return "", false
 	}
-	
+	return sub, true
+}
+
+func handlePublic(w http.ResponseWriter, r *http.Request, baseDomain string) {
+	// Determinar subdomain a partir del Host real de la request
+	subdomain, ok := extractSubdomain(r.Host, baseDomain)
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(fmt.Sprintf("Host inválido %q, se espera <subdomain>.%s", r.Host, baseDomain)))
+		return
+	}
+
 	// Buscar túnel
 	mu.RLock()
 	tunnel, exists := tunnels[subdomain]
@@ -296,28 +315,86 @@ func handlePublic(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(resp.Body))
 }
 
-func main() {
-	// Cargar certificado TLS para el túnel
-	certFile := getEnv("TLS_CERT_FILE", "server.crt")
-	keyFile := getEnv("TLS_KEY_FILE", "server.key")
+func printUsage() {
+	fmt.Println(`DNET Server - túnel HTTP estilo ngrok
 
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		log.Fatalf("Error loading TLS cert/key (%s/%s): %v", certFile, keyFile, err)
-	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+Uso:
+  dnet-server start [flags]
+
+Flags:
+  -tunnel-addr string   Dirección de escucha del túnel TLS (default ":9000")
+  -public-addr string   Dirección de escucha pública HTTP (default ":8080")
+  -cert string          Certificado TLS del túnel, modo manual/autofirmado (default "server.crt")
+  -key string           Clave privada TLS del túnel, modo manual/autofirmado (default "server.key")
+  -base-domain string   Dominio base para resolver subdomains por Host (default "localhost")
+  -domain string        Dominio real del túnel; si se indica, se usa Let's Encrypt en vez de -cert/-key
+  -email string         Email de contacto para Let's Encrypt (opcional)
+  -acme-http-addr string  Dirección del listener HTTP-01 de Let's Encrypt (default ":80")
+  -acme-cache-dir string  Directorio donde cachear los certificados de Let's Encrypt (default "autocert-cache")
+  -no-tls                Desactiva TLS en el túnel (texto plano). No recomendado salvo detrás
+                         de otro canal ya cifrado (VPN, red privada) (default false)`)
+}
+
+func runStart(args []string) {
+	fs := flag.NewFlagSet("start", flag.ExitOnError)
+	tunnelAddr := fs.String("tunnel-addr", getEnv("TUNNEL_ADDR", TunnelPort), "Dirección de escucha del túnel TLS")
+	publicAddr := fs.String("public-addr", getEnv("PUBLIC_ADDR", PublicPort), "Dirección de escucha pública HTTP")
+	certFile := fs.String("cert", getEnv("TLS_CERT_FILE", "server.crt"), "Certificado TLS del túnel, modo manual/autofirmado")
+	keyFile := fs.String("key", getEnv("TLS_KEY_FILE", "server.key"), "Clave privada TLS del túnel, modo manual/autofirmado")
+	baseDomain := fs.String("base-domain", getEnv("BASE_DOMAIN", "localhost"), "Dominio base para resolver subdomains por Host")
+	domain := fs.String("domain", getEnv("DOMAIN", ""), "Dominio real del túnel; si se indica, se usa Let's Encrypt en vez de -cert/-key")
+	email := fs.String("email", getEnv("ACME_EMAIL", ""), "Email de contacto para Let's Encrypt (opcional)")
+	acmeHTTPAddr := fs.String("acme-http-addr", getEnv("ACME_HTTP_ADDR", ":80"), "Dirección del listener HTTP-01 de Let's Encrypt")
+	acmeCacheDir := fs.String("acme-cache-dir", getEnv("ACME_CACHE_DIR", "autocert-cache"), "Directorio donde cachear los certificados de Let's Encrypt")
+	noTLS := fs.Bool("no-tls", getEnv("NO_TLS", "") == "true", "Desactiva TLS en el túnel (texto plano)")
+	fs.Parse(args)
+
+	var ln net.Listener
+	var err error
+
+	if *noTLS {
+		log.Println("⚠ TLS desactivado (-no-tls): el túnel viaja en texto plano, incluyendo el token de autenticación. Usar solo detrás de un canal ya cifrado.")
+		ln, err = net.Listen("tcp", *tunnelAddr)
+		if err != nil {
+			log.Fatalf("Error listening on tunnel port: %v", err)
+		}
+		log.Printf("Waiting for tunnel clients (sin TLS) on %s...", *tunnelAddr)
+	} else {
+		// Obtener el tls.Config del túnel: Let's Encrypt si se indicó -domain, certificado manual si no.
+		var tlsConfig *tls.Config
+		if *domain != "" {
+			manager := &autocert.Manager{
+				Prompt:     autocert.AcceptTOS,
+				Cache:      autocert.DirCache(*acmeCacheDir),
+				HostPolicy: autocert.HostWhitelist(*domain),
+				Email:      *email,
+			}
+			go func() {
+				log.Printf("Starting ACME HTTP-01 challenge listener on %s...", *acmeHTTPAddr)
+				if err := http.ListenAndServe(*acmeHTTPAddr, manager.HTTPHandler(nil)); err != nil {
+					log.Printf("ACME challenge server error: %v", err)
+				}
+			}()
+			tlsConfig = manager.TLSConfig()
+			log.Printf("Using Let's Encrypt certificate for %s (cache: %s)", *domain, *acmeCacheDir)
+		} else {
+			cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+			if err != nil {
+				log.Fatalf("Error loading TLS cert/key (%s/%s): %v", *certFile, *keyFile, err)
+			}
+			tlsConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+		}
+
+		ln, err = tls.Listen("tcp", *tunnelAddr, tlsConfig)
+		if err != nil {
+			log.Fatalf("Error listening on tunnel port: %v", err)
+		}
+		log.Printf("Waiting for tunnel clients (TLS) on %s...", *tunnelAddr)
 	}
 
-	// Escuchar conexiones del cliente (túnel) sobre TLS
-	tunnelAddr := getEnv("TUNNEL_ADDR", TunnelPort)
-	ln, err := tls.Listen("tcp", tunnelAddr, tlsConfig)
-	if err != nil {
-		log.Fatalf("Error listening on tunnel port: %v", err)
-	}
-	log.Printf("Waiting for tunnel clients (TLS) on %s...", tunnelAddr)
-	
 	// Aceptar múltiples clientes
 	go func() {
 		for {
@@ -331,10 +408,30 @@ func main() {
 	}()
 
 	// Servidor HTTP público
-	http.HandleFunc("/", handlePublic)
-	log.Printf("Public HTTP server on %s...", PublicPort)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		handlePublic(w, r, *baseDomain)
+	})
+	log.Printf("Public HTTP server on %s (base domain: %s)...", *publicAddr, *baseDomain)
 	log.Printf("Valid tokens: %v", getTokensList())
-	log.Fatal(http.ListenAndServe(PublicPort, nil))
+	log.Fatal(http.ListenAndServe(*publicAddr, nil))
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "start":
+		runStart(os.Args[2:])
+	case "-h", "--help", "help":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "Comando desconocido: %s\n\n", os.Args[1])
+		printUsage()
+		os.Exit(1)
+	}
 }
 
 func getTokensList() []string {

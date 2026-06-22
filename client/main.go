@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -18,6 +22,38 @@ const (
 	LocalAddr  = "http://localhost:8081"   // Servicio local a exponer
 	AuthToken  = "demo_token"      // Token de autenticación
 )
+
+// getEnv devuelve el valor de la variable de entorno o, si no está definida, el default.
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// loadTLSConfig construye el tls.Config para verificar el certificado del servidor
+// contra la CA indicada en TLS_CA_FILE (por defecto "ca.crt", junto al binario).
+func loadTLSConfig(serverAddr string) *tls.Config {
+	caFile := getEnv("TLS_CA_FILE", "ca.crt")
+
+	caCert, err := os.ReadFile(caFile)
+	if err != nil {
+		log.Fatalf("Error reading CA cert (%s): %v", caFile, err)
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("Error parsing CA cert (%s)", caFile)
+	}
+
+	serverName := getEnv("TLS_SERVER_NAME", strings.Split(serverAddr, ":")[0])
+
+	return &tls.Config{
+		RootCAs:    pool,
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+	}
+}
 
 // Protocolo de mensajes
 type Message struct {
@@ -41,12 +77,12 @@ type HTTPResponse struct {
 	Body       string              `json:"body"`
 }
 
-func connectWithRetry() net.Conn {
+func connectWithRetry(serverAddr string, tlsConfig *tls.Config) net.Conn {
 	retryDelay := 2 * time.Second
 	maxRetries := 5
-	
+
 	for attempt := 1; ; attempt++ {
-		conn, err := net.Dial("tcp", ServerAddr)
+		conn, err := tls.Dial("tcp", serverAddr, tlsConfig)
 		if err == nil {
 			log.Println("✓ Connected to tunnel server!")
 			return conn
@@ -212,12 +248,16 @@ func handleIncomingRequest(conn net.Conn, msg Message) {
 }
 
 func main() {
+	serverAddr := getEnv("SERVER_ADDR", ServerAddr)
+	tlsConfig := loadTLSConfig(serverAddr)
+
 	log.Printf("DNET Client - Exposing %s", LocalAddr)
+	log.Printf("Connecting to %s (TLS)", serverAddr)
 	log.Printf("Using token: %s", AuthToken)
-	
+
 	for {
 		// Conectar con reconexión automática
-		conn := connectWithRetry()
+		conn := connectWithRetry(serverAddr, tlsConfig)
 		
 		// Autenticar
 		if err := authenticate(conn); err != nil {

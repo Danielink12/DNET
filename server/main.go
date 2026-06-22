@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -17,6 +19,14 @@ const (
 	TunnelPort = ":9000" // Puerto para el túnel
 	PublicPort = ":8080" // Puerto público para exponer
 )
+
+// getEnv devuelve el valor de la variable de entorno o, si no está definida, el default.
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // Tokens válidos (en producción esto estaría en BD)
 var validTokens = map[string]string{
@@ -44,9 +54,9 @@ type Request struct {
 }
 
 type Response struct {
-	StatusCode int
-	Headers    map[string][]string
-	Body       []byte
+	StatusCode int                 `json:"status_code"`
+	Headers    map[string][]string `json:"headers"`
+	Body       string              `json:"body"`
 }
 
 // Protocolo de mensajes
@@ -213,7 +223,7 @@ func handleTunnelRequest(tunnel *Tunnel, req *Request) {
 		log.Printf("Error sending request to tunnel: %v", err)
 		req.Response <- &Response{
 			StatusCode: 502,
-			Body:       []byte("Bad Gateway"),
+			Body:       "Bad Gateway",
 		}
 		return
 	}
@@ -230,7 +240,7 @@ func handleTunnelRequest(tunnel *Tunnel, req *Request) {
 		
 		req.Response <- &Response{
 			StatusCode: 504,
-			Body:       []byte("Gateway Timeout"),
+			Body:       "Gateway Timeout",
 		}
 	}
 }
@@ -283,16 +293,30 @@ func handlePublic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(resp.Body)
+	w.Write([]byte(resp.Body))
 }
 
 func main() {
-	// Escuchar conexiones del cliente (túnel)
-	ln, err := net.Listen("tcp", TunnelPort)
+	// Cargar certificado TLS para el túnel
+	certFile := getEnv("TLS_CERT_FILE", "server.crt")
+	keyFile := getEnv("TLS_KEY_FILE", "server.key")
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("Error loading TLS cert/key (%s/%s): %v", certFile, keyFile, err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Escuchar conexiones del cliente (túnel) sobre TLS
+	tunnelAddr := getEnv("TUNNEL_ADDR", TunnelPort)
+	ln, err := tls.Listen("tcp", tunnelAddr, tlsConfig)
 	if err != nil {
 		log.Fatalf("Error listening on tunnel port: %v", err)
 	}
-	log.Printf("Waiting for tunnel clients on %s...", TunnelPort)
+	log.Printf("Waiting for tunnel clients (TLS) on %s...", tunnelAddr)
 	
 	// Aceptar múltiples clientes
 	go func() {

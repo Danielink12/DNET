@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,16 +14,36 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Configuración básica
 const (
-	ServerAddr = "localhost:9000" // Dirección del servidor central
-	LocalAddr  = "http://localhost:8081"   // Servicio local a exponer
-	AuthToken  = "demo_token"      // Token de autenticación
+	ServerAddr         = "localhost:9000"          // Dirección del servidor central
+	LocalAddr          = "http://localhost:8081"   // Servicio local a exponer
+	AuthToken          = "demo_token"               // Token de autenticación
+	DefaultMaxBodySize = 10 * 1024 * 1024            // 10 MB
 )
+
+// errBodyTooLarge señala que el body excede el límite configurado.
+var errBodyTooLarge = errors.New("body exceeds max size")
+
+// limitedRead lee como máximo maxBytes+1 bytes de r. Si el resultado supera
+// maxBytes, devuelve errBodyTooLarge sin haber materializado un body más
+// grande que el límite en memoria.
+func limitedRead(r io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errBodyTooLarge
+	}
+	return data, nil
+}
 
 // getEnv devuelve el valor de la variable de entorno o, si no está definida, el default.
 func getEnv(key, fallback string) string {
@@ -30,6 +51,20 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvInt64 devuelve el valor numérico de la variable de entorno, o el default
+// si no está definida o no es un número válido.
+func getEnvInt64(key string, fallback int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // loadTLSConfig construye el tls.Config para verificar el certificado del servidor.
@@ -160,7 +195,7 @@ func authenticate(conn net.Conn, token string) error {
 	return nil
 }
 
-func handleRequest(reqData HTTPRequest, localAddr string) (*HTTPResponse, error) {
+func handleRequest(reqData HTTPRequest, localAddr string, maxBodySize int64) (*HTTPResponse, error) {
 	// Construir URL completa
 	url := localAddr + reqData.Path
 	if reqData.Query != "" {
@@ -188,9 +223,15 @@ func handleRequest(reqData HTTPRequest, localAddr string) (*HTTPResponse, error)
 	}
 	defer resp.Body.Close()
 	
-	// Leer respuesta
-	body, err := io.ReadAll(resp.Body)
+	// Leer respuesta (con límite)
+	body, err := limitedRead(resp.Body, maxBodySize)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			return &HTTPResponse{
+				StatusCode: http.StatusBadGateway,
+				Body:       fmt.Sprintf("Local service response exceeds max size of %d bytes", maxBodySize),
+			}, nil
+		}
 		return nil, err
 	}
 	
@@ -204,8 +245,13 @@ func handleRequest(reqData HTTPRequest, localAddr string) (*HTTPResponse, error)
 	}, nil
 }
 
-func listenForRequests(conn net.Conn, localAddr string) {
+func listenForRequests(conn net.Conn, localAddr string, maxBodySize int64) {
 	reader := bufio.NewReader(conn)
+
+	// Cada request entrante se procesa en su propia goroutine (ver handleIncomingRequest),
+	// pero todas comparten la misma conexión TCP. writeMu serializa esos Write para que las
+	// respuestas no se entrelacen en el stream (mismo patrón que tunnel.mu en el servidor).
+	var writeMu sync.Mutex
 
 	for {
 		// Leer mensaje
@@ -226,12 +272,12 @@ func listenForRequests(conn net.Conn, localAddr string) {
 		}
 
 		if msg.Type == "request" {
-			go handleIncomingRequest(conn, msg, localAddr)
+			go handleIncomingRequest(conn, msg, localAddr, maxBodySize, &writeMu)
 		}
 	}
 }
 
-func handleIncomingRequest(conn net.Conn, msg Message, localAddr string) {
+func handleIncomingRequest(conn net.Conn, msg Message, localAddr string, maxBodySize int64, writeMu *sync.Mutex) {
 	// Parsear request
 	var reqData HTTPRequest
 	if err := json.Unmarshal(msg.Data, &reqData); err != nil {
@@ -242,7 +288,7 @@ func handleIncomingRequest(conn net.Conn, msg Message, localAddr string) {
 	log.Printf("→ %s %s", reqData.Method, reqData.Path)
 
 	// Ejecutar request local
-	resp, err := handleRequest(reqData, localAddr)
+	resp, err := handleRequest(reqData, localAddr, maxBodySize)
 	if err != nil {
 		log.Printf("Error handling request: %v", err)
 		// Enviar error
@@ -251,18 +297,21 @@ func handleIncomingRequest(conn net.Conn, msg Message, localAddr string) {
 			Body:       fmt.Sprintf("Bad Gateway: %v", err),
 		}
 	}
-	
+
 	log.Printf("← %d %s", resp.StatusCode, reqData.Path)
-	
+
 	// Enviar respuesta
 	responseMsg := Message{
 		Type:  "response",
 		ReqID: msg.ReqID,
 	}
 	responseMsg.Data, _ = json.Marshal(resp)
-	
+
 	data, _ := json.Marshal(responseMsg)
-	if _, err := conn.Write(append(data, '\n')); err != nil {
+	writeMu.Lock()
+	_, err = conn.Write(append(data, '\n'))
+	writeMu.Unlock()
+	if err != nil {
 		log.Printf("Error sending response: %v", err)
 	}
 }
@@ -282,7 +331,9 @@ Flags:
                        archivo solo para certificados autofirmados/de prueba (default "")
   -server-name string  Nombre esperado en el certificado del servidor (default: host de -server)
   -no-tls              Conecta en texto plano, sin TLS (debe coincidir con el servidor). No
-                       recomendado salvo detrás de otro canal ya cifrado (default false)`)
+                       recomendado salvo detrás de otro canal ya cifrado (default false)
+  -max-body-size int   Tamaño máximo en bytes de la respuesta del servicio local
+                       antes de reenviarla por el túnel (default 10485760, 10 MB)`)
 }
 
 func runConnect(args []string) {
@@ -293,6 +344,7 @@ func runConnect(args []string) {
 	caFile := fs.String("ca", getEnv("TLS_CA_FILE", ""), "Certificado CA para verificar al servidor (vacío = almacén del sistema)")
 	serverName := fs.String("server-name", getEnv("TLS_SERVER_NAME", ""), "Nombre esperado en el certificado del servidor")
 	noTLS := fs.Bool("no-tls", getEnv("NO_TLS", "") == "true", "Conecta en texto plano, sin TLS")
+	maxBody := fs.Int64("max-body-size", getEnvInt64("MAX_BODY_SIZE", DefaultMaxBodySize), "Tamaño máximo en bytes de la respuesta del servicio local")
 	fs.Parse(args)
 
 	var tlsConfig *tls.Config
@@ -325,7 +377,7 @@ func runConnect(args []string) {
 		log.Println("✓ Tunnel active! Listening for requests...")
 
 		// Escuchar requests
-		listenForRequests(conn, *localAddr)
+		listenForRequests(conn, *localAddr, *maxBody)
 
 		// Si llegamos aquí, la conexión se cerró
 		conn.Close()

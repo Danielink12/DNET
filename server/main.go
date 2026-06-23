@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +23,32 @@ import (
 
 // Configuración básica
 const (
-	TunnelPort = ":9000" // Puerto para el túnel
-	PublicPort = ":8080" // Puerto público para exponer
+	TunnelPort         = ":9000"            // Puerto para el túnel
+	PublicPort         = ":8080"             // Puerto público para exponer
+	DefaultMaxBodySize = 10 * 1024 * 1024 // 10 MB
 )
+
+// maxBodySize limita cuánto se lee del body de cada request pública antes de
+// reenviarla por el túnel. Se fija una sola vez en runStart a partir del flag
+// -max-body-size; el resto del código lo lee como variable de solo-lectura.
+var maxBodySize int64 = DefaultMaxBodySize
+
+// errBodyTooLarge señala que el body excede maxBodySize.
+var errBodyTooLarge = errors.New("body exceeds max size")
+
+// limitedRead lee como máximo maxBytes+1 bytes de r. Si el resultado supera
+// maxBytes, devuelve errBodyTooLarge sin haber materializado un body más
+// grande que el límite en memoria.
+func limitedRead(r io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errBodyTooLarge
+	}
+	return data, nil
+}
 
 // getEnv devuelve el valor de la variable de entorno o, si no está definida, el default.
 func getEnv(key, fallback string) string {
@@ -32,11 +58,18 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// Tokens válidos (en producción esto estaría en BD)
-var validTokens = map[string]string{
-	"token_user1": "user1",
-	"token_user2": "user2",
-	"demo_token":  "demo",
+// getEnvInt64 devuelve el valor numérico de la variable de entorno, o el default
+// si no está definida o no es un número válido.
+func getEnvInt64(key string, fallback int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // Estructura para manejar túneles
@@ -76,45 +109,48 @@ var (
 	mu      sync.RWMutex
 )
 
-func authenticateClient(conn net.Conn) (string, error) {
+func authenticateClient(conn net.Conn, db *sql.DB) (string, error) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	reader := bufio.NewReader(conn)
-	
+
 	// Leer mensaje de autenticación
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		return "", err
 	}
-	
+
 	var msg Message
 	if err := json.Unmarshal(line, &msg); err != nil {
 		return "", err
 	}
-	
+
 	if msg.Type != "auth" {
 		return "", fmt.Errorf("expected auth message")
 	}
-	
-	// Validar token
-	user, valid := validTokens[msg.Token]
+
+	// Validar token contra la base de datos
+	user, valid, err := lookupToken(db, msg.Token)
+	if err != nil {
+		return "", fmt.Errorf("token lookup failed: %w", err)
+	}
 	if !valid {
 		return "", fmt.Errorf("invalid token")
 	}
-	
+
 	// Enviar confirmación
 	response := Message{Type: "auth_ok"}
 	data, _ := json.Marshal(response)
 	conn.Write(append(data, '\n'))
 	conn.SetReadDeadline(time.Time{})
-	
+
 	return user, nil
 }
 
-func handleTunnelConnection(conn net.Conn) {
+func handleTunnelConnection(conn net.Conn, db *sql.DB) {
 	defer conn.Close()
-	
+
 	// Autenticar cliente
-	user, err := authenticateClient(conn)
+	user, err := authenticateClient(conn, db)
 	if err != nil {
 		log.Printf("Authentication failed: %v", err)
 		return
@@ -193,58 +229,65 @@ func handleTunnelConnection(conn net.Conn) {
 	}
 }
 
+// handleTunnelRequest registra el request pendiente y lo envía al cliente por el
+// túnel. No espera la respuesta: eso es responsabilidad exclusiva de handlePublic,
+// que es quien tiene el channel req.Response en su goroutine (una por request HTTP
+// entrante). Si ambas funciones recibieran del mismo channel (como antes), competirían
+// por el único valor que llega — quien pierda la carrera se queda esperando hasta el
+// timeout de 30s en cada request, y como este sender es la única goroutine que drena
+// tunnel.Requests por túnel, eso serializaba TODO el túnel a ~1 request cada 30s bajo
+// concurrencia real. No reintroducir un receive de req.Response aquí.
 func handleTunnelRequest(tunnel *Tunnel, req *Request) {
+	// Leer el body con límite ANTES de registrar el request pendiente: si excede
+	// el límite, respondemos directo sin tocar pendingRequests (nada que limpiar).
+	body, err := limitedRead(req.HTTPReq.Body, maxBodySize)
+	req.HTTPReq.Body.Close()
+	if err != nil {
+		statusCode := http.StatusBadGateway
+		msg := fmt.Sprintf("Error reading request body: %v", err)
+		if errors.Is(err, errBodyTooLarge) {
+			statusCode = http.StatusRequestEntityTooLarge
+			msg = fmt.Sprintf("Request body exceeds max size of %d bytes", maxBodySize)
+		}
+		req.Response <- &Response{StatusCode: statusCode, Body: msg}
+		return
+	}
+
 	// Registrar request pendiente
 	tunnel.pendingMu.Lock()
 	tunnel.pendingRequests[req.ID] = req.Response
 	tunnel.pendingMu.Unlock()
-	
+
 	// Enviar request al cliente
 	msg := Message{
 		Type:  "request",
 		ReqID: req.ID,
 	}
-	
+
 	// Serializar HTTP request
 	reqData := map[string]interface{}{
-		"method": req.HTTPReq.Method,
-		"path":   req.HTTPReq.URL.Path,
-		"query":  req.HTTPReq.URL.RawQuery,
+		"method":  req.HTTPReq.Method,
+		"path":    req.HTTPReq.URL.Path,
+		"query":   req.HTTPReq.URL.RawQuery,
 		"headers": req.HTTPReq.Header,
+		"body":    string(body),
 	}
-	body, _ := io.ReadAll(req.HTTPReq.Body)
-	req.HTTPReq.Body.Close()
-	reqData["body"] = string(body)
-	
+
 	msg.Data, _ = json.Marshal(reqData)
-	
+
 	tunnel.mu.Lock()
 	data, _ := json.Marshal(msg)
-	_, err := tunnel.Conn.Write(append(data, '\n'))
+	_, err = tunnel.Conn.Write(append(data, '\n'))
 	tunnel.mu.Unlock()
-	
+
 	if err != nil {
 		log.Printf("Error sending request to tunnel: %v", err)
-		req.Response <- &Response{
-			StatusCode: 502,
-			Body:       "Bad Gateway",
-		}
-		return
-	}
-	
-	// Esperar respuesta (con timeout)
-	select {
-	case <-req.Response:
-		// Respuesta recibida, nada más que hacer
-	case <-time.After(30 * time.Second):
-		// Timeout
 		tunnel.pendingMu.Lock()
 		delete(tunnel.pendingRequests, req.ID)
 		tunnel.pendingMu.Unlock()
-		
 		req.Response <- &Response{
-			StatusCode: 504,
-			Body:       "Gateway Timeout",
+			StatusCode: 502,
+			Body:       "Bad Gateway",
 		}
 	}
 }
@@ -302,9 +345,20 @@ func handlePublic(w http.ResponseWriter, r *http.Request, baseDomain string) {
 		return
 	}
 	
-	// Esperar respuesta
-	resp := <-req.Response
-	
+	// Esperar respuesta (con timeout). Único receptor de req.Response — ver el
+	// comentario en handleTunnelRequest sobre por qué no debe haber otro.
+	var resp *Response
+	select {
+	case resp = <-req.Response:
+	case <-time.After(30 * time.Second):
+		tunnel.pendingMu.Lock()
+		delete(tunnel.pendingRequests, req.ID)
+		tunnel.pendingMu.Unlock()
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte("Gateway Timeout"))
+		return
+	}
+
 	// Enviar respuesta al cliente HTTP
 	for k, values := range resp.Headers {
 		for _, v := range values {
@@ -332,7 +386,16 @@ Flags:
   -acme-http-addr string  Dirección del listener HTTP-01 de Let's Encrypt (default ":80")
   -acme-cache-dir string  Directorio donde cachear los certificados de Let's Encrypt (default "autocert-cache")
   -no-tls                Desactiva TLS en el túnel (texto plano). No recomendado salvo detrás
-                         de otro canal ya cifrado (VPN, red privada) (default false)`)
+                         de otro canal ya cifrado (VPN, red privada) (default false)
+  -db-dsn string         Cadena de conexión a PostgreSQL para validar tokens (requerido)
+                         ej: "postgres://usuario:clave@localhost:5432/dnet?sslmode=disable"
+  -max-body-size int     Tamaño máximo (en bytes) del body de cada request pública
+                         antes de reenviarla por el túnel (default 10485760, 10 MB)
+
+Gestión de tokens (-db-dsn antes de los argumentos, o usar DATABASE_URL):
+  dnet-server token add [-db-dsn ...] <token> <username>
+  dnet-server token list [-db-dsn ...]
+  dnet-server token remove [-db-dsn ...] <token>`)
 }
 
 func runStart(args []string) {
@@ -347,10 +410,22 @@ func runStart(args []string) {
 	acmeHTTPAddr := fs.String("acme-http-addr", getEnv("ACME_HTTP_ADDR", ":80"), "Dirección del listener HTTP-01 de Let's Encrypt")
 	acmeCacheDir := fs.String("acme-cache-dir", getEnv("ACME_CACHE_DIR", "autocert-cache"), "Directorio donde cachear los certificados de Let's Encrypt")
 	noTLS := fs.Bool("no-tls", getEnv("NO_TLS", "") == "true", "Desactiva TLS en el túnel (texto plano)")
+	dbDSN := fs.String("db-dsn", getEnv("DATABASE_URL", ""), "Cadena de conexión a PostgreSQL para validar tokens")
+	maxBody := fs.Int64("max-body-size", getEnvInt64("MAX_BODY_SIZE", DefaultMaxBodySize), "Tamaño máximo en bytes del body de cada request pública")
 	fs.Parse(args)
 
+	maxBodySize = *maxBody
+
+	if *dbDSN == "" {
+		log.Fatal("Falta -db-dsn (o DATABASE_URL): se requiere una base de datos PostgreSQL para validar tokens")
+	}
+	db, err := openTokenDB(*dbDSN)
+	if err != nil {
+		log.Fatalf("Error connecting to database: %v", err)
+	}
+	defer db.Close()
+
 	var ln net.Listener
-	var err error
 
 	if *noTLS {
 		log.Println("⚠ TLS desactivado (-no-tls): el túnel viaja en texto plano, incluyendo el token de autenticación. Usar solo detrás de un canal ya cifrado.")
@@ -403,7 +478,7 @@ func runStart(args []string) {
 				log.Printf("Error accepting connection: %v", err)
 				continue
 			}
-			go handleTunnelConnection(conn)
+			go handleTunnelConnection(conn, db)
 		}
 	}()
 
@@ -412,8 +487,73 @@ func runStart(args []string) {
 		handlePublic(w, r, *baseDomain)
 	})
 	log.Printf("Public HTTP server on %s (base domain: %s)...", *publicAddr, *baseDomain)
-	log.Printf("Valid tokens: %v", getTokensList())
+	if tokens, err := listTokens(db); err == nil {
+		log.Printf("Tokens registrados: %d", len(tokens))
+	}
 	log.Fatal(http.ListenAndServe(*publicAddr, nil))
+}
+
+func runToken(args []string) {
+	if len(args) < 1 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	sub := args[0]
+
+	fs := flag.NewFlagSet("token "+sub, flag.ExitOnError)
+	dbDSN := fs.String("db-dsn", getEnv("DATABASE_URL", ""), "Cadena de conexión a PostgreSQL")
+	fs.Parse(args[1:])
+	rest := fs.Args()
+
+	if *dbDSN == "" {
+		log.Fatal("Falta -db-dsn (o DATABASE_URL)")
+	}
+	db, err := openTokenDB(*dbDSN)
+	if err != nil {
+		log.Fatalf("Error connecting to database: %v", err)
+	}
+	defer db.Close()
+
+	switch sub {
+	case "add":
+		if len(rest) < 2 {
+			log.Fatal("Uso: dnet-server token add <token> <username>")
+		}
+		if err := addToken(db, rest[0], rest[1]); err != nil {
+			log.Fatalf("Error adding token: %v", err)
+		}
+		fmt.Printf("Token agregado: %s -> %s\n", rest[0], rest[1])
+	case "remove":
+		if len(rest) < 1 {
+			log.Fatal("Uso: dnet-server token remove <token>")
+		}
+		found, err := removeToken(db, rest[0])
+		if err != nil {
+			log.Fatalf("Error removing token: %v", err)
+		}
+		if !found {
+			fmt.Printf("Token no encontrado: %s\n", rest[0])
+			os.Exit(1)
+		}
+		fmt.Printf("Token eliminado: %s\n", rest[0])
+	case "list":
+		tokens, err := listTokens(db)
+		if err != nil {
+			log.Fatalf("Error listing tokens: %v", err)
+		}
+		if len(tokens) == 0 {
+			fmt.Println("No hay tokens registrados.")
+			return
+		}
+		for _, t := range tokens {
+			fmt.Printf("%s\t%s\n", t.Username, t.Token)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "Subcomando desconocido: %s\n\n", sub)
+		printUsage()
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -425,6 +565,8 @@ func main() {
 	switch os.Args[1] {
 	case "start":
 		runStart(os.Args[2:])
+	case "token":
+		runToken(os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -432,12 +574,4 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
-}
-
-func getTokensList() []string {
-	tokens := make([]string, 0, len(validTokens))
-	for token := range validTokens {
-		tokens = append(tokens, token)
-	}
-	return tokens
 }

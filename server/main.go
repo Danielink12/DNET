@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 )
 
 // Configuración básica
@@ -72,6 +74,20 @@ func getEnvInt64(key string, fallback int64) int64 {
 	return n
 }
 
+// getEnvFloat64 devuelve el valor numérico (float) de la variable de entorno,
+// o el default si no está definida o no es un número válido.
+func getEnvFloat64(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
 // Estructura para manejar túneles
 type Tunnel struct {
 	Conn     net.Conn
@@ -98,10 +114,11 @@ type Response struct {
 
 // Protocolo de mensajes
 type Message struct {
-	Type    string          `json:"type"` // "auth", "request", "response"
-	Token   string          `json:"token,omitempty"`
-	ReqID   string          `json:"req_id,omitempty"`
-	Data    json.RawMessage `json:"data,omitempty"`
+	Type      string          `json:"type"` // "auth", "auth_ok", "auth_error", "request", "response"
+	Token     string          `json:"token,omitempty"`
+	Subdomain string          `json:"subdomain,omitempty"`
+	ReqID     string          `json:"req_id,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
 }
 
 var (
@@ -109,57 +126,91 @@ var (
 	mu      sync.RWMutex
 )
 
-func authenticateClient(conn net.Conn, db *sql.DB) (string, error) {
+// subdomainRe valida que un subdomain sea una etiqueta DNS razonable: minúsculas,
+// dígitos y guiones, sin empezar ni terminar en guión. Se aplica tanto al
+// subdomain pedido explícitamente como al default (= username), para que
+// extractSubdomain nunca tenga que lidiar con algo inesperado más adelante.
+var subdomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func validSubdomain(s string) bool {
+	return subdomainRe.MatchString(s)
+}
+
+// sendAuthMessage escribe un Message de autenticación (auth_ok o auth_error)
+// al cliente. Para auth_error, reason va en Data como un string JSON, así el
+// cliente puede mostrar el motivo real en vez de un "authentication failed" genérico.
+func sendAuthMessage(conn net.Conn, msgType, reason string) {
+	resp := Message{Type: msgType}
+	if reason != "" {
+		resp.Data, _ = json.Marshal(reason)
+	}
+	data, _ := json.Marshal(resp)
+	conn.Write(append(data, '\n'))
+}
+
+// authenticateClient valida el token contra la base de datos y resuelve el
+// subdomain pedido por el cliente (o el username si no pidió ninguno). No
+// envía todavía auth_ok: eso queda para después de reservar el subdomain en
+// handleTunnelConnection, porque recién ahí se sabe si hay conflicto con otro
+// túnel activo. Tampoco envía auth_error en el caso de token inválido — ese
+// camino históricamente no confirma nada al cliente (evita filtrar si un
+// token existe o no); sí lo hace para el conflicto de subdomain, que no es
+// information disclosure.
+func authenticateClient(conn net.Conn, db *sql.DB) (user, subdomain string, err error) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	reader := bufio.NewReader(conn)
 
 	// Leer mensaje de autenticación
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	var msg Message
 	if err := json.Unmarshal(line, &msg); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if msg.Type != "auth" {
-		return "", fmt.Errorf("expected auth message")
+		return "", "", fmt.Errorf("expected auth message")
 	}
 
 	// Validar token contra la base de datos
 	user, valid, err := lookupToken(db, msg.Token)
 	if err != nil {
-		return "", fmt.Errorf("token lookup failed: %w", err)
+		return "", "", fmt.Errorf("token lookup failed: %w", err)
 	}
 	if !valid {
-		return "", fmt.Errorf("invalid token")
+		return "", "", fmt.Errorf("invalid token")
 	}
 
-	// Enviar confirmación
-	response := Message{Type: "auth_ok"}
-	data, _ := json.Marshal(response)
-	conn.Write(append(data, '\n'))
-	conn.SetReadDeadline(time.Time{})
+	subdomain = msg.Subdomain
+	if subdomain == "" {
+		subdomain = user
+	}
+	if !validSubdomain(subdomain) {
+		return "", "", fmt.Errorf("invalid subdomain %q", subdomain)
+	}
 
-	return user, nil
+	conn.SetReadDeadline(time.Time{})
+	return user, subdomain, nil
 }
 
 func handleTunnelConnection(conn net.Conn, db *sql.DB) {
 	defer conn.Close()
 
-	// Autenticar cliente
-	user, err := authenticateClient(conn, db)
+	// Autenticar cliente y resolver el subdomain pedido
+	user, subdomain, err := authenticateClient(conn, db)
 	if err != nil {
 		log.Printf("Authentication failed: %v", err)
 		return
 	}
-	
-	subdomain := user // Por simplicidad, subdomain = username
-	log.Printf("Tunnel established for user: %s (subdomain: %s)", user, subdomain)
-	
-	// Crear túnel
+
+	// Crear túnel y reservar el subdomain atómicamente: si ya hay un túnel
+	// activo con ese subdomain (de este mismo token u otro), se rechaza en vez
+	// de pisarlo silenciosamente — eso es lo que permite que un solo token
+	// sostenga varios túneles a la vez (cada uno con su propio -subdomain) sin
+	// que uno eche al otro por accidente.
 	tunnel := &Tunnel{
 		Conn:            conn,
 		User:            user,
@@ -170,10 +221,18 @@ func handleTunnelConnection(conn net.Conn, db *sql.DB) {
 		pendingMu:       &sync.Mutex{},
 	}
 
-	// Registrar túnel
 	mu.Lock()
+	if _, exists := tunnels[subdomain]; exists {
+		mu.Unlock()
+		log.Printf("Subdomain %q already in use, rejecting connection from user %s", subdomain, user)
+		sendAuthMessage(conn, "auth_error", fmt.Sprintf("subdomain %q already in use", subdomain))
+		return
+	}
 	tunnels[subdomain] = tunnel
 	mu.Unlock()
+
+	sendAuthMessage(conn, "auth_ok", "")
+	log.Printf("Tunnel established for user: %s (subdomain: %s)", user, subdomain)
 
 	defer func() {
 		mu.Lock()
@@ -308,12 +367,48 @@ func extractSubdomain(host, baseDomain string) (string, bool) {
 	return sub, true
 }
 
-func handlePublic(w http.ResponseWriter, r *http.Request, baseDomain string) {
+// clientIP devuelve la IP del que hace la request pública, sin el puerto.
+// No considera X-Forwarded-For ni similares (serían spoofables sin un proxy
+// de confianza configurado explícitamente) — usa la IP real de la conexión TCP.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// publicConfig agrupa la configuración de handlePublic que antes se pasaba
+// como parámetros sueltos; crece con el tiempo (rate limiting agregó dos
+// campos más), así que conviene mantenerlo así en vez de seguir agregando
+// parámetros a la función.
+type publicConfig struct {
+	baseDomain        string
+	ipLimiters        *limiterStore
+	subdomainLimiters *limiterStore
+}
+
+func handlePublic(w http.ResponseWriter, r *http.Request, cfg publicConfig) {
 	// Determinar subdomain a partir del Host real de la request
-	subdomain, ok := extractSubdomain(r.Host, baseDomain)
+	subdomain, ok := extractSubdomain(r.Host, cfg.baseDomain)
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(fmt.Sprintf("Host inválido %q, se espera <subdomain>.%s", r.Host, baseDomain)))
+		w.Write([]byte(fmt.Sprintf("Host inválido %q, se espera <subdomain>.%s", r.Host, cfg.baseDomain)))
+		return
+	}
+
+	// Rate limiting: por IP del que llama y por subdomain del túnel. Cualquiera
+	// de los dos que esté agotado bloquea la request — protege tanto contra un
+	// solo cliente abusivo como contra que un túnel concreto sature al resto.
+	ip := clientIP(r)
+	if !cfg.ipLimiters.allow(ip) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("Rate limit exceeded for your IP"))
+		return
+	}
+	if !cfg.subdomainLimiters.allow(subdomain) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(fmt.Sprintf("Rate limit exceeded for tunnel '%s'", subdomain)))
 		return
 	}
 
@@ -391,6 +486,10 @@ Flags:
                          ej: "postgres://usuario:clave@localhost:5432/dnet?sslmode=disable"
   -max-body-size int     Tamaño máximo (en bytes) del body de cada request pública
                          antes de reenviarla por el túnel (default 10485760, 10 MB)
+  -rate-limit-ip float             Requests/segundo permitidas por IP (default 20)
+  -rate-limit-ip-burst int          Ráfaga permitida por IP (default 40)
+  -rate-limit-subdomain float       Requests/segundo permitidas por túnel/subdomain (default 50)
+  -rate-limit-subdomain-burst int   Ráfaga permitida por túnel/subdomain (default 100)
 
 Gestión de tokens (-db-dsn antes de los argumentos, o usar DATABASE_URL):
   dnet-server token add [-db-dsn ...] <token> <username>
@@ -412,9 +511,23 @@ func runStart(args []string) {
 	noTLS := fs.Bool("no-tls", getEnv("NO_TLS", "") == "true", "Desactiva TLS en el túnel (texto plano)")
 	dbDSN := fs.String("db-dsn", getEnv("DATABASE_URL", ""), "Cadena de conexión a PostgreSQL para validar tokens")
 	maxBody := fs.Int64("max-body-size", getEnvInt64("MAX_BODY_SIZE", DefaultMaxBodySize), "Tamaño máximo en bytes del body de cada request pública")
+	rateLimitIP := fs.Float64("rate-limit-ip", getEnvFloat64("RATE_LIMIT_IP", 20), "Requests/segundo permitidas por IP")
+	rateLimitIPBurst := fs.Int("rate-limit-ip-burst", int(getEnvInt64("RATE_LIMIT_IP_BURST", 40)), "Ráfaga permitida por IP")
+	rateLimitSubdomain := fs.Float64("rate-limit-subdomain", getEnvFloat64("RATE_LIMIT_SUBDOMAIN", 50), "Requests/segundo permitidas por túnel/subdomain")
+	rateLimitSubdomainBurst := fs.Int("rate-limit-subdomain-burst", int(getEnvInt64("RATE_LIMIT_SUBDOMAIN_BURST", 100)), "Ráfaga permitida por túnel/subdomain")
 	fs.Parse(args)
 
 	maxBodySize = *maxBody
+
+	ipLimiters := newLimiterStore(rate.Limit(*rateLimitIP), *rateLimitIPBurst)
+	subdomainLimiters := newLimiterStore(rate.Limit(*rateLimitSubdomain), *rateLimitSubdomainBurst)
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			ipLimiters.cleanup(30 * time.Minute)
+			subdomainLimiters.cleanup(30 * time.Minute)
+		}
+	}()
 
 	if *dbDSN == "" {
 		log.Fatal("Falta -db-dsn (o DATABASE_URL): se requiere una base de datos PostgreSQL para validar tokens")
@@ -483,10 +596,16 @@ func runStart(args []string) {
 	}()
 
 	// Servidor HTTP público
+	publicCfg := publicConfig{
+		baseDomain:        *baseDomain,
+		ipLimiters:        ipLimiters,
+		subdomainLimiters: subdomainLimiters,
+	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handlePublic(w, r, *baseDomain)
+		handlePublic(w, r, publicCfg)
 	})
-	log.Printf("Public HTTP server on %s (base domain: %s)...", *publicAddr, *baseDomain)
+	log.Printf("Public HTTP server on %s (base domain: %s, rate limit: %.0f req/s/IP, %.0f req/s/subdomain)...",
+		*publicAddr, *baseDomain, *rateLimitIP, *rateLimitSubdomain)
 	if tokens, err := listTokens(db); err == nil {
 		log.Printf("Tokens registrados: %d", len(tokens))
 	}

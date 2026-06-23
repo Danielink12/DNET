@@ -104,10 +104,11 @@ func loadTLSConfig(caFile, serverAddr, serverNameOverride string) *tls.Config {
 
 // Protocolo de mensajes
 type Message struct {
-	Type    string          `json:"type"` // "auth", "request", "response"
-	Token   string          `json:"token,omitempty"`
-	ReqID   string          `json:"req_id,omitempty"`
-	Data    json.RawMessage `json:"data,omitempty"`
+	Type      string          `json:"type"` // "auth", "auth_ok", "auth_error", "request", "response"
+	Token     string          `json:"token,omitempty"`
+	Subdomain string          `json:"subdomain,omitempty"`
+	ReqID     string          `json:"req_id,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
 }
 
 type HTTPRequest struct {
@@ -157,22 +158,23 @@ func connectWithRetry(serverAddr string, tlsConfig *tls.Config) net.Conn {
 	}
 }
 
-func authenticate(conn net.Conn, token string) error {
+func authenticate(conn net.Conn, token, subdomain string) error {
 	// Enviar mensaje de autenticación
 	authMsg := Message{
-		Type:  "auth",
-		Token: token,
+		Type:      "auth",
+		Token:     token,
+		Subdomain: subdomain,
 	}
-	
+
 	data, err := json.Marshal(authMsg)
 	if err != nil {
 		return err
 	}
-	
+
 	if _, err := conn.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	
+
 	// Esperar confirmación
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	reader := bufio.NewReader(conn)
@@ -181,16 +183,21 @@ func authenticate(conn net.Conn, token string) error {
 		return err
 	}
 	conn.SetReadDeadline(time.Time{})
-	
+
 	var response Message
 	if err := json.Unmarshal(line, &response); err != nil {
 		return err
 	}
-	
+
 	if response.Type != "auth_ok" {
-		return fmt.Errorf("authentication failed")
+		reason := "authentication failed"
+		var detail string
+		if len(response.Data) > 0 && json.Unmarshal(response.Data, &detail) == nil && detail != "" {
+			reason = detail
+		}
+		return errors.New(reason)
 	}
-	
+
 	log.Println("✓ Authenticated successfully!")
 	return nil
 }
@@ -333,7 +340,11 @@ Flags:
   -no-tls              Conecta en texto plano, sin TLS (debe coincidir con el servidor). No
                        recomendado salvo detrás de otro canal ya cifrado (default false)
   -max-body-size int   Tamaño máximo en bytes de la respuesta del servicio local
-                       antes de reenviarla por el túnel (default 10485760, 10 MB)`)
+                       antes de reenviarla por el túnel (default 10485760, 10 MB)
+  -subdomain string    Subdomain a pedirle al servidor para este túnel. Vacío = usa
+                       el username asociado al token (comportamiento de antes). Un
+                       mismo token puede sostener varios túneles a la vez mientras
+                       cada uno pida un -subdomain distinto`)
 }
 
 func runConnect(args []string) {
@@ -345,6 +356,7 @@ func runConnect(args []string) {
 	serverName := fs.String("server-name", getEnv("TLS_SERVER_NAME", ""), "Nombre esperado en el certificado del servidor")
 	noTLS := fs.Bool("no-tls", getEnv("NO_TLS", "") == "true", "Conecta en texto plano, sin TLS")
 	maxBody := fs.Int64("max-body-size", getEnvInt64("MAX_BODY_SIZE", DefaultMaxBodySize), "Tamaño máximo en bytes de la respuesta del servicio local")
+	subdomain := fs.String("subdomain", getEnv("SUBDOMAIN", ""), "Subdomain a pedir para este túnel (vacío = username del token)")
 	fs.Parse(args)
 
 	var tlsConfig *tls.Config
@@ -367,7 +379,7 @@ func runConnect(args []string) {
 		conn := connectWithRetry(*serverAddr, tlsConfig)
 
 		// Autenticar
-		if err := authenticate(conn, *authToken); err != nil {
+		if err := authenticate(conn, *authToken, *subdomain); err != nil {
 			log.Printf("Authentication error: %v", err)
 			conn.Close()
 			time.Sleep(5 * time.Second)
